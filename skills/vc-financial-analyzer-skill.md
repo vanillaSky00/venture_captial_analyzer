@@ -27,7 +27,7 @@ going and how fast*. VC mentors prioritize trajectory over position.
 
 ---
 
-## Output Convention (v1.1+)
+## Output Convention (v1.2+)
 
 Each indicator is saved as its **own PNG file**, named by indicator, then all files are
 **zipped into one download**. Open the zip — the files sort into logical VC evaluation order.
@@ -41,10 +41,17 @@ vc_analysis/
   04_runway.png
   05_burn_multiple.png
   06_gross_margin.png
+  07_valuation.png           ← NEW: DCF / Comparables / Risk-Adjusted side-by-side
 ```
 
 **Why numbered filenames?** File explorers sort alphabetically — the `NN_` prefix keeps the
 summary card first and the metrics in logical VC evaluation order (survival → efficiency).
+
+**Text output (machine-readable for downstream agents):**
+
+```
+vc_financial_results.md     ← all computed values as structured markdown; feed this to the next skill
+```
 
 ---
 
@@ -345,7 +352,129 @@ plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "06_gross_margin.png"))
 ```
 
-### 6g. `00_vc_signal_summary.png` — Text Scorecard (open this first)
+### 6g. `07_valuation.png` — Valuation: DCF · Comparables · Risk-Adjusted
+
+Three methods, one chart. Shows each valuation estimate as a bar with an uncertainty band.
+Analyst reads the **overlap zone** as the credible range.
+
+**Three common valuation methods for startups:**
+
+| Method | Formula / Logic | Best For |
+|---|---|---|
+| **DCF** | PV of projected free cash flows at discount rate *r* | Companies with visible revenue trajectory |
+| **Comparables (EV/ARR)** | Peer median multiple × current ARR | SaaS with public comps |
+| **Risk-Adjusted** | DCF × (1 − failure_probability) | Seed / early-stage with high uncertainty |
+
+```python
+# ── VALUATION INPUTS (edit per company) ───────────────────────────────────────
+DISCOUNT_RATE       = 0.25          # 25% — typical VC hurdle rate
+TERMINAL_GROWTH     = 0.03          # 3% long-run growth after projection window
+PROJECTION_YEARS    = 5             # DCF horizon
+FCF_MARGIN          = 0.15          # Assumed FCF margin on projected revenue
+EV_ARR_MULTIPLE     = 8.0           # Comparable median (public SaaS comps, adjust per sector)
+EV_ARR_RANGE        = (5.0, 12.0)   # Low / high comparable range
+FAILURE_PROBABILITY = 0.40          # Risk-adjusted discount (40% = Series A typical)
+
+# Use last-period revenue as ARR proxy (replace with actual ARR if available)
+last_rev = df["revenue"].iloc[-1]
+ann_rev  = last_rev * 4             # annualize quarterly revenue → ARR proxy
+
+# ── DCF VALUATION ─────────────────────────────────────────────────────────────
+rev_growth = df["growth_rate"].dropna().mean() / 100   # average QoQ, convert to decimal
+proj_revs  = [ann_rev * ((1 + rev_growth) ** yr) for yr in range(1, PROJECTION_YEARS + 1)]
+proj_fcfs  = [r * FCF_MARGIN for r in proj_revs]
+
+# Terminal value (Gordon Growth Model)
+terminal_value = proj_fcfs[-1] * (1 + TERMINAL_GROWTH) / (DISCOUNT_RATE - TERMINAL_GROWTH)
+
+dcf_value = sum(fcf / (1 + DISCOUNT_RATE) ** t
+                for t, fcf in enumerate(proj_fcfs, 1))
+dcf_value += terminal_value / (1 + DISCOUNT_RATE) ** PROJECTION_YEARS
+
+# ── COMPARABLES VALUATION ─────────────────────────────────────────────────────
+comp_value_mid  = ann_rev * EV_ARR_MULTIPLE
+comp_value_low  = ann_rev * EV_ARR_RANGE[0]
+comp_value_high = ann_rev * EV_ARR_RANGE[1]
+
+# ── RISK-ADJUSTED VALUATION ───────────────────────────────────────────────────
+risk_adj_value  = dcf_value * (1 - FAILURE_PROBABILITY)
+# ±30% uncertainty band on risk-adjusted
+risk_adj_low    = risk_adj_value * 0.70
+risk_adj_high   = risk_adj_value * 1.30
+
+# ── CHART ─────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(12, 7))
+fig.patch.set_facecolor("#0f0f14")
+fig.suptitle("Company  ·  Valuation Estimate: DCF vs Comparables vs Risk-Adjusted",
+             fontsize=14, fontweight="bold", color="#e0e0f0")
+
+labels     = ["DCF\n(Intrinsic)", "Comparables\n(EV/ARR)", "Risk-Adjusted\n(DCF × Survival)"]
+midpoints  = [dcf_value,      comp_value_mid,  risk_adj_value]
+lows       = [dcf_value*0.75, comp_value_low,  risk_adj_low]
+highs      = [dcf_value*1.25, comp_value_high, risk_adj_high]
+bar_colors = [COLORS["primary"], COLORS["forecast"], COLORS["warning"]]
+
+x = np.arange(len(labels))
+bars = ax.bar(x, [m/1e6 for m in midpoints], color=bar_colors, width=0.5, alpha=0.85, zorder=3)
+
+# Error bars = uncertainty / comparable range
+yerr_low  = [(m - l)/1e6 for m, l in zip(midpoints, lows)]
+yerr_high = [(h - m)/1e6 for m, h in zip(midpoints, highs)]
+ax.errorbar(x, [m/1e6 for m in midpoints],
+            yerr=[yerr_low, yerr_high],
+            fmt="none", color="#e0e0f0", capsize=10, capthick=2, linewidth=2, zorder=4)
+
+# Annotate bar tops
+for bar, mid in zip(bars, midpoints):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(midpoints)*0.01/1e6,
+            f"${mid/1e6:.1f}M", ha="center", va="bottom", fontsize=12,
+            fontweight="bold", color="#e0e0f0")
+
+# Overlap band (credible range = max of lows → min of highs)
+overlap_low  = max(lows)  / 1e6
+overlap_high = min(highs) / 1e6
+if overlap_low < overlap_high:
+    ax.axhspan(overlap_low, overlap_high,
+               color=COLORS["positive"], alpha=0.08, label=f"Credible range ${overlap_low:.1f}M–${overlap_high:.1f}M")
+    ax.axhline(overlap_low,  color=COLORS["positive"], linewidth=1.2, linestyle="--", alpha=0.6)
+    ax.axhline(overlap_high, color=COLORS["positive"], linewidth=1.2, linestyle="--", alpha=0.6)
+
+# Annotation box: inputs used
+param_text = (f"Inputs:  r = {DISCOUNT_RATE*100:.0f}%  |  "
+              f"EV/ARR = {EV_ARR_MULTIPLE:.1f}×  |  "
+              f"Failure prob = {FAILURE_PROBABILITY*100:.0f}%  |  "
+              f"ARR proxy = ${ann_rev/1e6:.2f}M")
+ax.text(0.5, -0.10, param_text, transform=ax.transAxes,
+        ha="center", fontsize=8.5, color="#888899")
+
+ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=11)
+ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0fM"))
+ax.set_ylabel("Estimated Valuation ($M)")
+ax.legend(loc="upper right"); ax.grid(True, axis="y", alpha=0.4); ax.set_axisbelow(True)
+plt.tight_layout(pad=2.5)
+saved_files.append(save_fig(fig, "07_valuation.png"))
+
+# ── STORE VALUATION RESULTS (for vc_financial_results.md writer) ──────────────
+valuation_results = {
+    "dcf_value_M":        round(dcf_value / 1e6, 2),
+    "dcf_low_M":          round(dcf_value * 0.75 / 1e6, 2),
+    "dcf_high_M":         round(dcf_value * 1.25 / 1e6, 2),
+    "comp_value_mid_M":   round(comp_value_mid / 1e6, 2),
+    "comp_value_low_M":   round(comp_value_low / 1e6, 2),
+    "comp_value_high_M":  round(comp_value_high / 1e6, 2),
+    "risk_adj_value_M":   round(risk_adj_value / 1e6, 2),
+    "risk_adj_low_M":     round(risk_adj_low / 1e6, 2),
+    "risk_adj_high_M":    round(risk_adj_high / 1e6, 2),
+    "overlap_low_M":      round(overlap_low, 2) if overlap_low < overlap_high else None,
+    "overlap_high_M":     round(overlap_high, 2) if overlap_low < overlap_high else None,
+    "arr_proxy_M":        round(ann_rev / 1e6, 2),
+    "discount_rate_pct":  DISCOUNT_RATE * 100,
+    "ev_arr_multiple":    EV_ARR_MULTIPLE,
+    "failure_prob_pct":   FAILURE_PROBABILITY * 100,
+}
+```
+
+### 6h. `00_vc_signal_summary.png` — Text Scorecard (open this first)
 
 ```python
 fig, ax = plt.subplots(figsize=(10, 6))
@@ -392,7 +521,7 @@ saved_files.append(save_fig(fig, "00_vc_signal_summary.png"))
 
 ---
 
-## Step 7 — Zip All Charts (always last)
+
 
 ```python
 with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -408,9 +537,184 @@ with zipfile.ZipFile(ZIP_PATH, "r") as zf:
 
 ---
 
-## Step 8 — Prediction Methods (Tiered by Data Availability)
+## Step 7a — Zip All Charts
 
-> **Rule:** Use the simplest model that answers the question.
+```python
+with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+    for fpath in sorted(saved_files):
+        arcname = os.path.join("vc_analysis", os.path.basename(fpath))
+        zf.write(fpath, arcname)
+
+print(f"✅  Zip ready: {ZIP_PATH}")
+with zipfile.ZipFile(ZIP_PATH, "r") as zf:
+    for name in sorted(zf.namelist()):
+        print(f"  {name}  ({zf.getinfo(name).file_size//1024} KB)")
+```
+
+---
+
+## Step 7b — Write `vc_financial_results.md` (Machine-Readable Handoff)
+
+> **Why?** The `.md` file captures every computed value as clean structured text so a
+> downstream agent (report writer, memo generator, investment committee summarizer) can
+> read it as a string without parsing binary chart files.
+>
+> **Rule:** Write this file **after all charts are generated**, so all values are final.
+
+```python
+import datetime
+
+MD_PATH = "./vc_financial_results.md"
+
+# ── COLLECT SIGNAL ROWS (reuse from signal_summary logic) ─────────────────────
+bm_all = df["burn_multiple"].dropna()
+
+def slope_label(slope, good_dir="up"):
+    if good_dir == "up":
+        return "↑ Positive" if slope > 0.05 else ("→ Stable" if slope > -0.02 else "↓ Declining")
+    else:
+        return "↓ Improving" if slope < -0.02 else ("→ Stable" if slope < 0.05 else "↑ Worsening")
+
+def signal_emoji(slope, good_dir="up"):
+    if good_dir == "up":
+        return "🟢" if slope > 0.05 else ("🟡" if slope > -0.02 else "🔴")
+    else:
+        return "🟢" if slope < -0.02 else ("🟡" if slope < 0.05 else "🔴")
+
+# Compute slopes (use variables already produced by chart sections)
+slope_rev  = np.polyfit(np.arange(len(df)), df["revenue"], 1)[0] / df["revenue"].mean()
+slope_gr   = np.polyfit(np.arange(len(df["growth_rate"].dropna())),
+                        df["growth_rate"].dropna(), 1)[0]
+slope_burn = np.polyfit(np.arange(len(df)), df["burn"], 1)[0] / df["burn"].mean()
+slope_run  = np.polyfit(np.arange(len(df)), df["runway"], 1)[0]
+slope_bm   = np.polyfit(np.arange(len(bm_all)), bm_all, 1)[0]
+slope_gm   = np.polyfit(np.arange(len(df)), df["gross_margin"] * 100, 1)[0]
+
+fy_rev_end = linear_forecast(df["revenue"], FORECAST_PERIODS)[0][-1]
+fy_run_end = linear_forecast(df["runway"],  FORECAST_PERIODS)[0][-1]
+fy_gm_end  = linear_forecast(df["gross_margin"] * 100, FORECAST_PERIODS)[0][-1]
+fy_bm_end  = linear_forecast(bm_all.values, FORECAST_PERIODS)[0][-1]
+
+# ── WRITE MARKDOWN ─────────────────────────────────────────────────────────────
+lines = []
+lines.append(f"# VC Financial Results")
+lines.append(f"\n> Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
+lines.append(f"> Company: **{COMPANY_NAME}**  ")
+lines.append(f"> Data range: {df['date'].iloc[0].strftime('%Y-Q%q')} → "
+             f"{df['date'].iloc[-1].strftime('%Y-Q%q')}  "
+             .replace('%q', str((df['date'].iloc[0].month-1)//3+1))
+             .replace('%q', str((df['date'].iloc[-1].month-1)//3+1)))
+lines.append(f"> Forecast window: {FORECAST_PERIODS} quarters forward\n")
+
+# ── SECTION 1: SIGNAL SUMMARY ─────────────────────────────────────────────────
+lines.append("## 1. VC Signal Summary\n")
+lines.append("| Metric | Latest Value | Trend Slope | Direction | Signal |")
+lines.append("|--------|-------------|-------------|-----------|--------|")
+
+signal_table = [
+    ("Revenue (Latest Qtr)",  f"${df['revenue'].iloc[-1]/1e6:.2f}M",   slope_rev,  "up"),
+    ("QoQ Growth Rate",       f"{df['growth_rate'].iloc[-1]:.1f}%",    slope_gr,   "up"),
+    ("Burn Rate",             f"${df['burn'].iloc[-1]/1e3:.0f}K/qtr",  slope_burn, "down"),
+    ("Runway",                f"{df['runway'].iloc[-1]:.1f} months",   slope_run,  "up"),
+    ("Burn Multiple",         f"{bm_all.iloc[-1]:.2f}×",               slope_bm,   "down"),
+    ("Gross Margin",          f"{df['gross_margin'].iloc[-1]*100:.0f}%", slope_gm, "up"),
+]
+
+for name, val, slope, gdir in signal_table:
+    lines.append(f"| {name} | {val} | {slope:+.3f} | {slope_label(slope, gdir)} | {signal_emoji(slope, gdir)} |")
+
+# ── SECTION 2: TIME-SERIES DATA ───────────────────────────────────────────────
+lines.append("\n## 2. Historical Data (all quarters)\n")
+lines.append("| Quarter | Revenue ($K) | Burn ($K) | Cash ($K) | Runway (mo) | Burn Mult | Gross Margin % |")
+lines.append("|---------|-------------|----------|----------|-------------|-----------|----------------|")
+for _, row in df.iterrows():
+    qtr = row["date"].strftime("%Y-Q") + str((row["date"].month-1)//3+1)
+    bm  = f"{row['burn_multiple']:.2f}" if not pd.isna(row["burn_multiple"]) else "—"
+    lines.append(f"| {qtr} | {row['revenue']/1e3:.0f} | {row['burn']/1e3:.0f} | "
+                 f"{row['cash']/1e3:.0f} | {row['runway']:.1f} | {bm} | {row['gross_margin']*100:.1f}% |")
+
+# ── SECTION 3: FORECASTS ──────────────────────────────────────────────────────
+lines.append("\n## 3. Linear Forecast (next quarter projections)\n")
+lines.append("| Metric | Forecast End-Value | Method |")
+lines.append("|--------|--------------------|--------|")
+lines.append(f"| Revenue | ${fy_rev_end/1e6:.2f}M / qtr | Linear regression |")
+lines.append(f"| Runway | {fy_run_end:.1f} months | Linear regression |")
+lines.append(f"| Gross Margin | {fy_gm_end:.1f}% | Linear regression |")
+lines.append(f"| Burn Multiple | {fy_bm_end:.2f}× | Linear regression |")
+
+# ── SECTION 4: VALUATION ──────────────────────────────────────────────────────
+lines.append("\n## 4. Valuation Estimates\n")
+lines.append(f"ARR Proxy (annualized last quarter): **${valuation_results['arr_proxy_M']:.2f}M**\n")
+lines.append("| Method | Low ($M) | Mid ($M) | High ($M) | Notes |")
+lines.append("|--------|---------|---------|---------|-------|")
+lines.append(
+    f"| DCF (Intrinsic) | ${valuation_results['dcf_low_M']} | "
+    f"${valuation_results['dcf_value_M']} | ${valuation_results['dcf_high_M']} | "
+    f"r={valuation_results['discount_rate_pct']:.0f}%, {PROJECTION_YEARS}yr horizon |"
+)
+lines.append(
+    f"| Comparables (EV/ARR) | ${valuation_results['comp_value_low_M']} | "
+    f"${valuation_results['comp_value_mid_M']} | ${valuation_results['comp_value_high_M']} | "
+    f"{EV_ARR_RANGE[0]}–{EV_ARR_RANGE[1]}× EV/ARR multiple |"
+)
+lines.append(
+    f"| Risk-Adjusted | ${valuation_results['risk_adj_low_M']} | "
+    f"${valuation_results['risk_adj_value_M']} | ${valuation_results['risk_adj_high_M']} | "
+    f"DCF × (1 − {valuation_results['failure_prob_pct']:.0f}% failure) |"
+)
+
+if valuation_results["overlap_low_M"] is not None:
+    lines.append(
+        f"\n**Credible range (overlap of all methods):** "
+        f"${valuation_results['overlap_low_M']}M — ${valuation_results['overlap_high_M']}M"
+    )
+
+# ── SECTION 5: KEY TAKEAWAYS (auto-generated flags) ───────────────────────────
+lines.append("\n## 5. Automated Flags\n")
+
+flags = []
+if df["runway"].iloc[-1] < 12:
+    flags.append("🔴 **RUNWAY CRITICAL** — less than 12 months; fundraising urgency high.")
+elif df["runway"].iloc[-1] < 18:
+    flags.append("🟡 **RUNWAY WATCH** — 12–18 months; plan next round within 2 quarters.")
+
+if bm_all.iloc[-1] > 2.0:
+    flags.append(f"🔴 **HIGH BURN MULTIPLE** — {bm_all.iloc[-1]:.2f}× (target <1.5×); capital efficiency needs attention.")
+elif bm_all.iloc[-1] > 1.5:
+    flags.append(f"🟡 **BURN MULTIPLE ELEVATED** — {bm_all.iloc[-1]:.2f}× (target <1.5×).")
+
+if df["gross_margin"].iloc[-1] < 0.50:
+    flags.append(f"🔴 **LOW GROSS MARGIN** — {df['gross_margin'].iloc[-1]*100:.0f}% (SaaS floor 70%).")
+elif df["gross_margin"].iloc[-1] < 0.70:
+    flags.append(f"🟡 **GROSS MARGIN BELOW BENCHMARK** — {df['gross_margin'].iloc[-1]*100:.0f}% (target 70–80%).")
+
+if slope_gr > 0.05:
+    flags.append("🟢 **GROWTH ACCELERATING** — QoQ growth rate trend is positive.")
+elif slope_gr < -0.05:
+    flags.append("🔴 **GROWTH DECELERATING** — QoQ growth rate is declining.")
+
+if not flags:
+    flags.append("🟢 All monitored metrics within acceptable ranges.")
+
+for f in flags:
+    lines.append(f"- {f}")
+
+lines.append(f"\n---\n*Auto-generated by vc-financial-analyzer skill v1.2. "
+             f"Not investment advice.*\n")
+
+# ── SAVE ──────────────────────────────────────────────────────────────────────
+with open(MD_PATH, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines))
+print(f"📄  Results written → {MD_PATH}")
+```
+
+> **Note for agents consuming `vc_financial_results.md`:** All numeric values are embedded
+> inline in markdown tables. Parse with any markdown-aware tool or read as plain text.
+> Section headers (`## 1.`, `## 2.` …) act as anchors for targeted extraction.
+
+---
+
+## Step 8 — Prediction Methods (Tiered by Data Availability)
 
 | Method | When to Use | Min Periods | Python |
 |---|---|---|---|
@@ -448,16 +752,20 @@ def linear_forecast(values, n_periods):
 
 ## Step 10 — Final Checklist
 
+- [ ] `COMPANY_NAME` variable set at top of script
 - [ ] Canvas `plt.rcParams.update()` set once at top, before any plot calls
 - [ ] Each indicator has its own `fig, ax = plt.subplots(figsize=(12, 6))`
 - [ ] Every metric shown as trend over time (no isolated single bars)
 - [ ] Rolling average (window=3) on all noisy series
 - [ ] Forward forecast + confidence band on all continuous metrics
 - [ ] Bar charts color-coded green/orange/red by threshold
-- [ ] Summary card `00_vc_signal_summary.png` saved last
+- [ ] **Valuation chart `07_valuation.png`** includes DCF, Comparables, and Risk-Adjusted bars with error bands
+- [ ] **`valuation_results` dict** populated before writing the `.md` file
+- [ ] Summary card `00_vc_signal_summary.png` saved last (before zip)
 - [ ] All filenames prefixed `NN_` for correct directory sort order
 - [ ] `save_fig()` called for every chart (adds footer, closes figure)
-- [ ] `zipfile.ZipFile` wraps everything into `vc_analysis/` folder
+- [ ] `zipfile.ZipFile` wraps everything into `vc_analysis/` folder (Step 7a)
+- [ ] **`vc_financial_results.md` written** with all 5 sections: signals, history, forecasts, valuation, flags (Step 7b)
 
 ---
 
@@ -500,8 +808,9 @@ def linear_forecast(values, n_periods):
 
 ```python
 """
-vc_charts.py  —  VC Financial Analyzer: Individual Chart Exports
+vc_charts.py  —  VC Financial Analyzer v1.2: Individual Chart Exports + MD Results
 Saves one PNG per indicator -> zips into vc_analysis_charts.zip
+Also writes vc_financial_results.md for downstream agent handoff.
 
 Output:
   vc_analysis/
@@ -512,6 +821,9 @@ Output:
     04_runway.png
     05_burn_multiple.png
     06_gross_margin.png
+    07_valuation.png
+  vc_analysis_charts.zip
+  vc_financial_results.md
 """
 
 import os, zipfile
@@ -523,9 +835,11 @@ from matplotlib.patches import Patch
 import warnings
 warnings.filterwarnings("ignore")
 
-# ── PATHS ─────────────────────────────────────────────────────────────────────
-OUT_DIR  = "./vc_analysis"
-ZIP_PATH = "./vc_analysis_charts.zip"
+# ── PATHS & CONFIG ────────────────────────────────────────────────────────────
+COMPANY_NAME = "NovaSaaS Inc."           # ← change per analysis
+OUT_DIR      = "./vc_analysis"
+ZIP_PATH     = "./vc_analysis_charts.zip"
+MD_PATH      = "./vc_financial_results.md"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ── CANVAS CONFIG ─────────────────────────────────────────────────────────────
@@ -792,6 +1106,89 @@ ax.text(0.04, 0.04, note, fontsize=8.5, color="#555570", transform=ax.transAxes)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "00_vc_signal_summary.png"))
 
+# ── CHART 7: VALUATION ────────────────────────────────────────────────────────
+DISCOUNT_RATE       = 0.25
+TERMINAL_GROWTH     = 0.03
+PROJECTION_YEARS    = 5
+FCF_MARGIN          = 0.15
+EV_ARR_MULTIPLE     = 8.0
+EV_ARR_RANGE        = (5.0, 12.0)
+FAILURE_PROBABILITY = 0.40
+
+ann_rev    = df["revenue"].iloc[-1] * 4
+rev_growth = df["growth_rate"].dropna().mean() / 100
+proj_revs  = [ann_rev * ((1 + rev_growth) ** yr) for yr in range(1, PROJECTION_YEARS + 1)]
+proj_fcfs  = [r * FCF_MARGIN for r in proj_revs]
+terminal_v = proj_fcfs[-1] * (1 + TERMINAL_GROWTH) / (DISCOUNT_RATE - TERMINAL_GROWTH)
+dcf_value  = sum(f / (1+DISCOUNT_RATE)**t for t,f in enumerate(proj_fcfs,1))
+dcf_value += terminal_v / (1+DISCOUNT_RATE)**PROJECTION_YEARS
+
+comp_value_mid  = ann_rev * EV_ARR_MULTIPLE
+comp_value_low  = ann_rev * EV_ARR_RANGE[0]
+comp_value_high = ann_rev * EV_ARR_RANGE[1]
+risk_adj_value  = dcf_value * (1 - FAILURE_PROBABILITY)
+risk_adj_low    = risk_adj_value * 0.70
+risk_adj_high   = risk_adj_value * 1.30
+
+fig, ax = plt.subplots(figsize=(12, 7))
+fig.patch.set_facecolor("#0f0f14")
+fig.suptitle(f"{COMPANY_NAME}  ·  Valuation: DCF vs Comparables vs Risk-Adjusted",
+             fontsize=14, fontweight="bold", color="#e0e0f0")
+
+labels    = ["DCF\n(Intrinsic)", "Comparables\n(EV/ARR)", "Risk-Adjusted\n(DCF × Survival)"]
+midpoints = [dcf_value, comp_value_mid, risk_adj_value]
+lows      = [dcf_value*0.75, comp_value_low,  risk_adj_low]
+highs     = [dcf_value*1.25, comp_value_high, risk_adj_high]
+bcolors   = [COLORS["primary"], COLORS["forecast"], COLORS["warning"]]
+
+x = np.arange(len(labels))
+bars = ax.bar(x, [m/1e6 for m in midpoints], color=bcolors, width=0.5, alpha=0.85, zorder=3)
+ax.errorbar(x, [m/1e6 for m in midpoints],
+            yerr=[[(m-l)/1e6 for m,l in zip(midpoints,lows)],
+                  [(h-m)/1e6 for m,h in zip(midpoints,highs)]],
+            fmt="none", color="#e0e0f0", capsize=10, capthick=2, linewidth=2, zorder=4)
+for bar, mid in zip(bars, midpoints):
+    ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+max(midpoints)*0.01/1e6,
+            f"${mid/1e6:.1f}M", ha="center", va="bottom", fontsize=12,
+            fontweight="bold", color="#e0e0f0")
+
+overlap_low  = max(lows)  / 1e6
+overlap_high = min(highs) / 1e6
+if overlap_low < overlap_high:
+    ax.axhspan(overlap_low, overlap_high, color=COLORS["positive"], alpha=0.08,
+               label=f"Credible range ${overlap_low:.1f}M–${overlap_high:.1f}M")
+    ax.axhline(overlap_low,  color=COLORS["positive"], linewidth=1.2, linestyle="--", alpha=0.6)
+    ax.axhline(overlap_high, color=COLORS["positive"], linewidth=1.2, linestyle="--", alpha=0.6)
+
+ax.text(0.5, -0.10,
+        f"r={DISCOUNT_RATE*100:.0f}%  |  EV/ARR={EV_ARR_MULTIPLE:.1f}×  |  "
+        f"Failure prob={FAILURE_PROBABILITY*100:.0f}%  |  ARR proxy=${ann_rev/1e6:.2f}M",
+        transform=ax.transAxes, ha="center", fontsize=8.5, color="#888899")
+ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=11)
+ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0fM"))
+ax.set_ylabel("Estimated Valuation ($M)")
+ax.legend(loc="upper right"); ax.grid(True, axis="y", alpha=0.4); ax.set_axisbelow(True)
+plt.tight_layout(pad=2.5)
+saved_files.append(save_fig(fig, "07_valuation.png"))
+
+valuation_results = {
+    "dcf_value_M":       round(dcf_value/1e6, 2),
+    "dcf_low_M":         round(dcf_value*0.75/1e6, 2),
+    "dcf_high_M":        round(dcf_value*1.25/1e6, 2),
+    "comp_value_mid_M":  round(comp_value_mid/1e6, 2),
+    "comp_value_low_M":  round(comp_value_low/1e6, 2),
+    "comp_value_high_M": round(comp_value_high/1e6, 2),
+    "risk_adj_value_M":  round(risk_adj_value/1e6, 2),
+    "risk_adj_low_M":    round(risk_adj_low/1e6, 2),
+    "risk_adj_high_M":   round(risk_adj_high/1e6, 2),
+    "overlap_low_M":     round(overlap_low, 2) if overlap_low < overlap_high else None,
+    "overlap_high_M":    round(overlap_high, 2) if overlap_low < overlap_high else None,
+    "arr_proxy_M":       round(ann_rev/1e6, 2),
+    "discount_rate_pct": DISCOUNT_RATE*100,
+    "ev_arr_multiple":   EV_ARR_MULTIPLE,
+    "failure_prob_pct":  FAILURE_PROBABILITY*100,
+}
+
 # ── ZIP ───────────────────────────────────────────────────────────────────────
 print(f"\n📦  Zipping {len(saved_files)} charts...")
 with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -802,6 +1199,117 @@ print(f"✅  Done → {ZIP_PATH}")
 with zipfile.ZipFile(ZIP_PATH, "r") as zf:
     for name in sorted(zf.namelist()):
         print(f"  {name}  ({zf.getinfo(name).file_size//1024} KB)")
+
+# ── WRITE vc_financial_results.md ─────────────────────────────────────────────
+import datetime
+
+def _slope_label(slope, good_dir="up"):
+    if good_dir == "up":
+        return "↑ Positive" if slope > 0.05 else ("→ Stable" if slope > -0.02 else "↓ Declining")
+    return "↓ Improving" if slope < -0.02 else ("→ Stable" if slope < 0.05 else "↑ Worsening")
+
+def _sig_emoji(slope, good_dir="up"):
+    if good_dir == "up":
+        return "🟢" if slope > 0.05 else ("🟡" if slope > -0.02 else "🔴")
+    return "🟢" if slope < -0.02 else ("🟡" if slope < 0.05 else "🔴")
+
+bm_all   = df["burn_multiple"].dropna()
+s_rev    = np.polyfit(np.arange(n), df["revenue"], 1)[0] / df["revenue"].mean()
+s_gr     = np.polyfit(np.arange(n-1), df["growth_rate"].dropna(), 1)[0]
+s_burn   = np.polyfit(np.arange(n), df["burn"], 1)[0] / df["burn"].mean()
+s_run    = np.polyfit(np.arange(n), df["runway"], 1)[0]
+s_bm     = np.polyfit(np.arange(len(bm_all)), bm_all, 1)[0]
+s_gm     = np.polyfit(np.arange(n), df["gross_margin"]*100, 1)[0]
+
+fy_rev_e = linear_forecast(df["revenue"], FORECAST_PERIODS)[0][-1]
+fy_run_e = linear_forecast(df["runway"],  FORECAST_PERIODS)[0][-1]
+fy_gm_e  = linear_forecast(df["gross_margin"]*100, FORECAST_PERIODS)[0][-1]
+fy_bm_e  = linear_forecast(bm_all.values, FORECAST_PERIODS)[0][-1]
+
+lines = []
+lines.append("# VC Financial Results")
+lines.append(f"\n> Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
+lines.append(f"> Company: **{COMPANY_NAME}**  ")
+start_q = df['date'].iloc[0];  end_q = df['date'].iloc[-1]
+lines.append(f"> Data range: {start_q.strftime('%Y')}-Q{(start_q.month-1)//3+1} → "
+             f"{end_q.strftime('%Y')}-Q{(end_q.month-1)//3+1}  ")
+lines.append(f"> Forecast window: {FORECAST_PERIODS} quarters forward\n")
+
+lines.append("## 1. VC Signal Summary\n")
+lines.append("| Metric | Latest Value | Trend Slope | Direction | Signal |")
+lines.append("|--------|-------------|-------------|-----------|--------|")
+for name, val, slope, gdir in [
+    ("Revenue (Latest Qtr)",  f"${df['revenue'].iloc[-1]/1e6:.2f}M",    s_rev,  "up"),
+    ("QoQ Growth Rate",       f"{df['growth_rate'].iloc[-1]:.1f}%",     s_gr,   "up"),
+    ("Burn Rate",             f"${df['burn'].iloc[-1]/1e3:.0f}K/qtr",   s_burn, "down"),
+    ("Runway",                f"{df['runway'].iloc[-1]:.1f} months",    s_run,  "up"),
+    ("Burn Multiple",         f"{bm_all.iloc[-1]:.2f}×",                s_bm,   "down"),
+    ("Gross Margin",          f"{df['gross_margin'].iloc[-1]*100:.0f}%", s_gm,  "up"),
+]:
+    lines.append(f"| {name} | {val} | {slope:+.3f} | {_slope_label(slope,gdir)} | {_sig_emoji(slope,gdir)} |")
+
+lines.append("\n## 2. Historical Data (all quarters)\n")
+lines.append("| Quarter | Revenue ($K) | Burn ($K) | Cash ($K) | Runway (mo) | Burn Mult | Gross Margin % |")
+lines.append("|---------|-------------|----------|----------|-------------|-----------|----------------|")
+for _, row in df.iterrows():
+    qtr = f"{row['date'].strftime('%Y')}-Q{(row['date'].month-1)//3+1}"
+    bm  = f"{row['burn_multiple']:.2f}" if not pd.isna(row["burn_multiple"]) else "—"
+    lines.append(f"| {qtr} | {row['revenue']/1e3:.0f} | {row['burn']/1e3:.0f} | "
+                 f"{row['cash']/1e3:.0f} | {row['runway']:.1f} | {bm} | {row['gross_margin']*100:.1f}% |")
+
+lines.append("\n## 3. Linear Forecast (end of projection window)\n")
+lines.append("| Metric | Forecast End-Value | Method |")
+lines.append("|--------|--------------------|--------|")
+lines.append(f"| Revenue | ${fy_rev_e/1e6:.2f}M / qtr | Linear regression |")
+lines.append(f"| Runway | {fy_run_e:.1f} months | Linear regression |")
+lines.append(f"| Gross Margin | {fy_gm_e:.1f}% | Linear regression |")
+lines.append(f"| Burn Multiple | {fy_bm_e:.2f}× | Linear regression |")
+
+lines.append("\n## 4. Valuation Estimates\n")
+lines.append(f"ARR Proxy (annualized last quarter): **${valuation_results['arr_proxy_M']:.2f}M**\n")
+lines.append("| Method | Low ($M) | Mid ($M) | High ($M) | Notes |")
+lines.append("|--------|---------|---------|---------|-------|")
+lines.append(f"| DCF (Intrinsic) | ${valuation_results['dcf_low_M']} | "
+             f"${valuation_results['dcf_value_M']} | ${valuation_results['dcf_high_M']} | "
+             f"r={valuation_results['discount_rate_pct']:.0f}%, {PROJECTION_YEARS}yr |")
+lines.append(f"| Comparables (EV/ARR) | ${valuation_results['comp_value_low_M']} | "
+             f"${valuation_results['comp_value_mid_M']} | ${valuation_results['comp_value_high_M']} | "
+             f"{EV_ARR_RANGE[0]}–{EV_ARR_RANGE[1]}× multiple |")
+lines.append(f"| Risk-Adjusted | ${valuation_results['risk_adj_low_M']} | "
+             f"${valuation_results['risk_adj_value_M']} | ${valuation_results['risk_adj_high_M']} | "
+             f"DCF × (1−{valuation_results['failure_prob_pct']:.0f}%) |")
+if valuation_results["overlap_low_M"] is not None:
+    lines.append(f"\n**Credible range:** ${valuation_results['overlap_low_M']}M — "
+                 f"${valuation_results['overlap_high_M']}M")
+
+lines.append("\n## 5. Automated Flags\n")
+flags = []
+if df["runway"].iloc[-1] < 12:
+    flags.append("🔴 **RUNWAY CRITICAL** — less than 12 months; fundraising urgency high.")
+elif df["runway"].iloc[-1] < 18:
+    flags.append("🟡 **RUNWAY WATCH** — 12–18 months; plan next round within 2 quarters.")
+if bm_all.iloc[-1] > 2.0:
+    flags.append(f"🔴 **HIGH BURN MULTIPLE** — {bm_all.iloc[-1]:.2f}× (target <1.5×).")
+elif bm_all.iloc[-1] > 1.5:
+    flags.append(f"🟡 **BURN MULTIPLE ELEVATED** — {bm_all.iloc[-1]:.2f}× (target <1.5×).")
+if df["gross_margin"].iloc[-1] < 0.50:
+    flags.append(f"🔴 **LOW GROSS MARGIN** — {df['gross_margin'].iloc[-1]*100:.0f}% (SaaS floor 70%).")
+elif df["gross_margin"].iloc[-1] < 0.70:
+    flags.append(f"🟡 **GROSS MARGIN BELOW BENCHMARK** — {df['gross_margin'].iloc[-1]*100:.0f}%.")
+if s_gr > 0.05:
+    flags.append("🟢 **GROWTH ACCELERATING** — QoQ growth rate trend is positive.")
+elif s_gr < -0.05:
+    flags.append("🔴 **GROWTH DECELERATING** — QoQ growth rate is declining.")
+if not flags:
+    flags.append("🟢 All monitored metrics within acceptable ranges.")
+for f in flags:
+    lines.append(f"- {f}")
+
+lines.append(f"\n---\n*Auto-generated by vc-financial-analyzer v1.2. Not investment advice.*\n")
+
+with open(MD_PATH, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines))
+print(f"📄  Results written → {MD_PATH}")
 ```
 
 ---
@@ -812,6 +1320,7 @@ with zipfile.ZipFile(ZIP_PATH, "r") as zf:
 |---|---|---|
 | v1.0 | 2026-05-17 | Initial skill — 4-panel dashboard, linear forecast, VC signal layer |
 | v1.1 | 2026-05-17 | **Output format changed** — one PNG per indicator named by metric, zipped for download. No dashboard. Added `00_vc_signal_summary.png` scorecard. |
+| v1.2 | 2026-05-17 | **Valuation module added** — `07_valuation.png` with DCF, Comparables (EV/ARR), Risk-Adjusted bars + uncertainty bands. **`vc_financial_results.md` writer added** — structured markdown handoff for downstream agents (5 sections: signals, history, forecasts, valuation, auto-flags). `COMPANY_NAME` variable. |
 | v1.x | — | *(your next iteration here)* |
 
 ---
