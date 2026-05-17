@@ -62,7 +62,8 @@ Before writing any code, ask:
 1. **What data do you have?** (CSV upload, manual table, public filings, API like yfinance?)
 2. **What stage is the company?** (Pre-revenue, growth, late-stage / public)
 3. **Time horizon?** (Quarterly for private; daily/weekly for public stocks)
-4. **Prediction window?** (e.g., forecast next 3–6 quarters)
+4. **Time basis for every input?** (`monthly`, `quarterly`, or `annual`; especially for burn/cost)
+5. **Prediction window?** (e.g., forecast next 3–6 periods)
 
 > If the user has no data, generate a realistic synthetic dataset to demonstrate the workflow
 > (see the full demo script at the bottom of this document).
@@ -80,7 +81,9 @@ Before writing any code, ask:
 | Advanced | Alpha Vantage API (free tier) | `requests` + JSON |
 
 **For private companies:** user must supply data manually (pitch deck, data room, investor
-updates). Always accept a minimal CSV with columns: `date, revenue, burn, cash`.
+updates). Always accept a minimal CSV with columns: `date, revenue, burn, cash`, but
+require one explicit metadata value: `PERIOD = "month" | "quarter" | "year"`. Never assume
+that `burn` is monthly just because the metric is called burn.
 
 ---
 
@@ -114,6 +117,81 @@ Evaluate in this order (highest signal first):
 
 ---
 
+## Step 3a — Reliability Guardrail: Normalize Time Units First
+
+Most chart bugs come from mixing monthly, quarterly, and annual units. Before any chart is
+drawn, normalize derived metrics once and reuse those columns everywhere.
+
+```python
+import pandas as pd
+import numpy as np
+
+# Required metadata. Set this from the source file or user prompt.
+PERIOD = "quarter"  # one of: "month", "quarter", "year"
+DATE_FREQ_BY_PERIOD = {"month": "MS", "quarter": "QS", "year": "YS"}
+PERIODS_PER_YEAR_BY_PERIOD = {"month": 12, "quarter": 4, "year": 1}
+PERIOD_LABEL_BY_PERIOD = {"month": "month", "quarter": "qtr", "year": "yr"}
+
+if PERIOD not in PERIODS_PER_YEAR_BY_PERIOD:
+    raise ValueError("PERIOD must be one of: month, quarter, year")
+
+PERIODS_PER_YEAR = PERIODS_PER_YEAR_BY_PERIOD[PERIOD]
+MONTHS_PER_PERIOD = 12 / PERIODS_PER_YEAR
+DATE_FREQ = DATE_FREQ_BY_PERIOD[PERIOD]
+PERIOD_LABEL = PERIOD_LABEL_BY_PERIOD[PERIOD]
+
+def annualize(values):
+    return values * PERIODS_PER_YEAR
+
+def period_label(ts):
+    ts = pd.Timestamp(ts)
+    if PERIOD == "year":
+        return f"{ts.year}"
+    if PERIOD == "quarter":
+        return f"{ts.year}-Q{(ts.month - 1)//3 + 1}"
+    return ts.strftime("%Y-%m")
+
+def add_derived_metrics(df):
+    """Create one source of truth for charts and markdown.
+
+    Input contract:
+      revenue = revenue for the period
+      burn    = cash burn or cost proxy for the period, not necessarily monthly
+      cash    = ending cash balance
+      gross_margin = decimal (0.72 means 72%)
+    """
+    required = {"date", "revenue", "burn", "cash", "gross_margin"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # Runway is always months. If burn is quarterly, divide by 3; if annual, divide by 12.
+    df["monthly_burn"] = df["burn"] / MONTHS_PER_PERIOD
+    df["runway"] = np.where(df["monthly_burn"] > 0, df["cash"] / df["monthly_burn"], np.nan)
+
+    # Burn multiple uses period burn divided by net new annualized revenue.
+    df["annualized_revenue"] = annualize(df["revenue"])
+    df["net_new_arr"] = df["annualized_revenue"].diff()
+    df["burn_multiple"] = np.where(df["net_new_arr"] > 0, df["burn"] / df["net_new_arr"], np.nan)
+
+    df["revenue_ma"] = df["revenue"].rolling(3, min_periods=1).mean()
+    df["growth_rate"] = df["revenue"].pct_change() * 100
+    df["growth_ma"] = df["growth_rate"].rolling(3, min_periods=1).mean()
+    return df
+```
+
+**Important:** If the company is profitable and `burn` is a cost proxy such as OpEx or
+COGS+OpEx, rename the chart/metric as a cost-efficiency proxy. Do not present it as cash
+burn unless the input is actual net cash burn. For public annual P&L data, prefer:
+`cost_efficiency_multiple = (total_cost.diff() / revenue.diff())`, and label it
+`ΔTotal Cost ÷ ΔRevenue` instead of `Burn Multiple`.
+
+---
+
 ## Step 4 — Canvas & Chart Configuration
 
 **Set the canvas once, globally, before any `plt.plot()` calls.**
@@ -122,9 +200,26 @@ Evaluate in this order (highest signal first):
 import os, zipfile
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import matplotlib.font_manager as fm
 from matplotlib.patches import Patch
 import pandas as pd
 import numpy as np
+
+def choose_font_family():
+    """Prefer CJK-capable fonts when charts include Chinese company names."""
+    candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                fm.fontManager.addfont(path)
+            except Exception:
+                pass
+    return ["PingFang TC", "STHeiti", "Hiragino Sans GB", "Arial Unicode MS", "DejaVu Sans"]
 
 # ── CANVAS CONFIG ─────────────────────────────────────────────────────────────
 plt.rcParams.update({
@@ -139,7 +234,8 @@ plt.rcParams.update({
     "grid.linestyle":    "--",
     "grid.alpha":        0.5,
     "lines.linewidth":   2.2,
-    "font.family":       "DejaVu Sans",
+    "font.family":       choose_font_family(),
+    "axes.unicode_minus": False,
     "font.size":         10,
     "axes.titlesize":    13,
     "axes.titleweight":  "bold",
@@ -200,19 +296,19 @@ fig.patch.set_facecolor("#0f0f14")
 fig.suptitle("Company  ·  Revenue Trend + Forecast", fontsize=14, fontweight="bold", color="#e0e0f0")
 
 ax.plot(df["date"], df["revenue"] / 1e6,    color=COLORS["neutral"], alpha=0.45, linewidth=1.5, label="Actual Revenue")
-ax.plot(df["date"], df["revenue_ma"] / 1e6, color=COLORS["primary"], linewidth=2.8, label="3-Qtr Rolling Avg")
+ax.plot(df["date"], df["revenue_ma"] / 1e6, color=COLORS["primary"], linewidth=2.8, label="3-period rolling avg")
 ax.plot(f_dates, fy_rev / 1e6, color=COLORS["forecast"], linewidth=2.2, linestyle="--", label="Linear Forecast")
 ax.fill_between(f_dates, fy_rev/1e6 * 0.82, fy_rev/1e6 * 1.18,
                 color=COLORS["forecast"], alpha=0.12, label="±18% Band")
 
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.1fM"))
-ax.set_ylabel("Revenue ($M)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Revenue ($M)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="upper left"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "01_revenue_trend.png"))
 ```
 
-### 6b. `02_growth_rate.png` — QoQ Growth + Momentum Zones
+### 6b. `02_growth_rate.png` — Period Growth + Momentum Zones
 
 ```python
 df["growth_rate"] = df["revenue"].pct_change() * 100
@@ -221,19 +317,19 @@ valid = df["growth_rate"].notna()
 
 fig, ax = plt.subplots(figsize=(12, 6))
 fig.patch.set_facecolor("#0f0f14")
-fig.suptitle("Company  ·  QoQ Revenue Growth Rate (%)", fontsize=14, fontweight="bold", color="#e0e0f0")
+fig.suptitle("Company  ·  Period Revenue Growth Rate (%)", fontsize=14, fontweight="bold", color="#e0e0f0")
 
 ax.fill_between(df["date"][valid], 0, df["growth_rate"][valid],
                 where=(df["growth_rate"][valid] > 0), color=COLORS["positive"], alpha=0.2)
 ax.fill_between(df["date"][valid], 0, df["growth_rate"][valid],
                 where=(df["growth_rate"][valid] < 0), color=COLORS["danger"], alpha=0.2)
 ax.plot(df["date"][valid], df["growth_rate"][valid], color=COLORS["neutral"], alpha=0.5, linewidth=1.5)
-ax.plot(df["date"][valid], df["growth_ma"][valid],   color=COLORS["primary"], linewidth=2.8, label="3-Qtr Avg")
+ax.plot(df["date"][valid], df["growth_ma"][valid],   color=COLORS["primary"], linewidth=2.8, label="3-Period Avg")
 ax.axhline(0,  color="#444455", linewidth=1.0)
 ax.axhline(15, color=COLORS["positive"], linewidth=1.2, linestyle=":", alpha=0.7, label="15% VC Benchmark")
 
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
-ax.set_ylabel("Growth Rate (%)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Growth Rate (%)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="upper right"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "02_growth_rate.png"))
@@ -248,7 +344,7 @@ fy_burn, _ = linear_forecast(df["burn"] / 1e3, FORECAST_PERIODS)
 
 fig, ax = plt.subplots(figsize=(12, 6))
 fig.patch.set_facecolor("#0f0f14")
-fig.suptitle("Company  ·  Burn Rate by Quarter", fontsize=14, fontweight="bold", color="#e0e0f0")
+fig.suptitle("Company  ·  Burn Rate by Period", fontsize=14, fontweight="bold", color="#e0e0f0")
 
 ax.bar(df["date"], df["burn"] / 1e3, color=bar_colors, width=55, alpha=0.85)
 ax.plot(df["date"], df["burn"]/1e3, color=COLORS["neutral"], linewidth=1.5, linestyle=":", alpha=0.6)
@@ -262,7 +358,7 @@ legend_els = [
 ]
 ax.legend(handles=legend_els, loc="upper right")
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0fK"))
-ax.set_ylabel("Burn Rate ($K/qtr)"); ax.set_xlabel("Quarter")
+ax.set_ylabel(f"Burn Rate ($K/{PERIOD_LABEL})"); ax.set_xlabel(PERIOD.title())
 ax.grid(True, axis="y"); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "03_burn_rate.png"))
@@ -288,7 +384,7 @@ ax.axhline(12, color=COLORS["danger"],   linewidth=1.2, linestyle=":", alpha=0.7
 ax.axhspan(0,  12, color=COLORS["danger"],  alpha=0.04)
 ax.axhspan(12, 18, color=COLORS["warning"], alpha=0.04)
 
-ax.set_ylabel("Runway (months)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Runway (months)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="upper left"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "04_runway.png"))
@@ -319,7 +415,7 @@ ax.axhspan(1.5, 4.0, color=COLORS["danger"],   alpha=0.04)
 ax.fill_between(df["date"][bm_valid], bm_vals, 2.0,
                 where=(bm_vals < 2.0), color=COLORS["positive"], alpha=0.08)
 ax.set_ylim(0, 4)
-ax.set_ylabel("Burn Multiple (×)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Burn Multiple (×)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="upper right"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "05_burn_multiple.png"))
@@ -336,7 +432,7 @@ fig.patch.set_facecolor("#0f0f14")
 fig.suptitle("Company  ·  Gross Margin % Trend", fontsize=14, fontweight="bold", color="#e0e0f0")
 
 ax.plot(df["date"], df["gross_margin"] * 100, color=COLORS["neutral"], alpha=0.5, linewidth=1.5, label="Actual")
-ax.plot(df["date"], gm_ma, color=COLORS["accent"], linewidth=2.8, label="3-Qtr Rolling Avg")
+ax.plot(df["date"], gm_ma, color=COLORS["accent"], linewidth=2.8, label="3-period rolling avg")
 ax.plot(f_dates, fy_gm, color=COLORS["forecast"], linewidth=2.2, linestyle="--", label="Forecast")
 ax.fill_between(f_dates, fy_gm - 3, fy_gm + 3, color=COLORS["forecast"], alpha=0.1, label="±3pp Band")
 
@@ -346,7 +442,7 @@ ax.axhline(50, color=COLORS["danger"],   linewidth=1.2, linestyle=":", alpha=0.7
 
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
 ax.set_ylim(30, 100)
-ax.set_ylabel("Gross Margin (%)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Gross Margin (%)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="lower right"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "06_gross_margin.png"))
@@ -377,11 +473,12 @@ FAILURE_PROBABILITY = 0.40          # Risk-adjusted discount (40% = Series A typ
 
 # Use last-period revenue as ARR proxy (replace with actual ARR if available)
 last_rev = df["revenue"].iloc[-1]
-ann_rev  = last_rev * 4             # annualize quarterly revenue → ARR proxy
+ann_rev  = annualize(last_rev)      # annualize period revenue → ARR proxy
 
 # ── DCF VALUATION ─────────────────────────────────────────────────────────────
-rev_growth = df["growth_rate"].dropna().mean() / 100   # average QoQ, convert to decimal
-proj_revs  = [ann_rev * ((1 + rev_growth) ** yr) for yr in range(1, PROJECTION_YEARS + 1)]
+avg_period_growth = df["growth_rate"].dropna().mean() / 100
+annual_growth = (1 + avg_period_growth) ** PERIODS_PER_YEAR - 1
+proj_revs  = [ann_rev * ((1 + annual_growth) ** yr) for yr in range(1, PROJECTION_YEARS + 1)]
 proj_fcfs  = [r * FCF_MARGIN for r in proj_revs]
 
 # Terminal value (Gordon Growth Model)
@@ -482,23 +579,23 @@ fig.patch.set_facecolor("#0f0f14")
 ax.set_facecolor("#0f0f14"); ax.axis("off")
 fig.suptitle("Company  ·  VC Signal Summary", fontsize=14, fontweight="bold", color="#e0e0f0")
 
-def signal_row(name, current, slope, good_dir="up"):
+def signal_row(name, current, slope, good_dir="up", stable_band=0.02):
     if good_dir == "up":
-        color = COLORS["positive"] if slope > 0.05 else (COLORS["warning"] if slope > -0.02 else COLORS["danger"])
-        emoji = "●" if slope > 0.05 else ("◑" if slope > -0.02 else "○")
+        color = COLORS["positive"] if slope > stable_band else (COLORS["warning"] if slope >= -stable_band else COLORS["danger"])
+        emoji = "●" if slope > stable_band else ("◑" if slope >= -stable_band else "○")
     else:
-        color = COLORS["positive"] if slope < -0.02 else (COLORS["warning"] if slope < 0.05 else COLORS["danger"])
-        emoji = "●" if slope < -0.02 else ("◑" if slope < 0.05 else "○")
+        color = COLORS["positive"] if slope < -stable_band else (COLORS["warning"] if slope <= stable_band else COLORS["danger"])
+        emoji = "●" if slope < -stable_band else ("◑" if slope <= stable_band else "○")
     return name, current, f"{slope:+.2f}", color, emoji
 
 # Build one signal_row() call per metric
 rows = [
-    signal_row("Revenue Growth",  "display_value", slope_rev,  "up"),
-    signal_row("QoQ Growth Rate", "display_value", slope_gr,   "up"),
-    signal_row("Burn Rate",       "display_value", slope_burn, "down"),
-    signal_row("Runway",          "display_value", slope_run,  "up"),
-    signal_row("Burn Multiple",   "display_value", slope_bm,   "down"),
-    signal_row("Gross Margin",    "display_value", slope_gm,   "up"),
+    signal_row("Revenue Growth",      "display_value", slope_rev,  "up",   0.02),
+    signal_row("Period Growth Rate",  "display_value", slope_gr,   "up",   2.0),  # percentage points / period
+    signal_row("Burn Rate",           "display_value", slope_burn, "down", 0.02),
+    signal_row("Runway",              "display_value", slope_run,  "up",   1.0),  # months / period
+    signal_row("Burn Multiple",       "display_value", slope_bm,   "down", 0.10),
+    signal_row("Gross Margin",        "display_value", slope_gm,   "up",   1.0),  # percentage points / period
 ]
 
 header_y = 0.88
@@ -568,27 +665,28 @@ MD_PATH = "./vc_financial_results.md"
 
 # ── COLLECT SIGNAL ROWS (reuse from signal_summary logic) ─────────────────────
 bm_all = df["burn_multiple"].dropna()
+latest_bm = bm_all.iloc[-1] if not bm_all.empty else np.nan
+latest_bm_label = f"{latest_bm:.2f}×" if not pd.isna(latest_bm) else "n/a"
 
-def slope_label(slope, good_dir="up"):
+def slope_label(slope, good_dir="up", stable_band=0.02):
     if good_dir == "up":
-        return "↑ Positive" if slope > 0.05 else ("→ Stable" if slope > -0.02 else "↓ Declining")
+        return "↑ Positive" if slope > stable_band else ("→ Stable" if slope >= -stable_band else "↓ Declining")
     else:
-        return "↓ Improving" if slope < -0.02 else ("→ Stable" if slope < 0.05 else "↑ Worsening")
+        return "↓ Improving" if slope < -stable_band else ("→ Stable" if slope <= stable_band else "↑ Worsening")
 
-def signal_emoji(slope, good_dir="up"):
+def signal_emoji(slope, good_dir="up", stable_band=0.02):
     if good_dir == "up":
-        return "🟢" if slope > 0.05 else ("🟡" if slope > -0.02 else "🔴")
+        return "🟢" if slope > stable_band else ("🟡" if slope >= -stable_band else "🔴")
     else:
-        return "🟢" if slope < -0.02 else ("🟡" if slope < 0.05 else "🔴")
+        return "🟢" if slope < -stable_band else ("🟡" if slope <= stable_band else "🔴")
 
 # Compute slopes (use variables already produced by chart sections)
-slope_rev  = np.polyfit(np.arange(len(df)), df["revenue"], 1)[0] / df["revenue"].mean()
-slope_gr   = np.polyfit(np.arange(len(df["growth_rate"].dropna())),
-                        df["growth_rate"].dropna(), 1)[0]
-slope_burn = np.polyfit(np.arange(len(df)), df["burn"], 1)[0] / df["burn"].mean()
-slope_run  = np.polyfit(np.arange(len(df)), df["runway"], 1)[0]
-slope_bm   = np.polyfit(np.arange(len(bm_all)), bm_all, 1)[0]
-slope_gm   = np.polyfit(np.arange(len(df)), df["gross_margin"] * 100, 1)[0]
+slope_rev  = safe_slope(df["revenue"], df["revenue"].mean())
+slope_gr   = safe_slope(df["growth_rate"])
+slope_burn = safe_slope(df["burn"], df["burn"].mean())
+slope_run  = safe_slope(df["runway"])
+slope_bm   = safe_slope(bm_all)
+slope_gm   = safe_slope(df["gross_margin"] * 100)
 
 fy_rev_end = linear_forecast(df["revenue"], FORECAST_PERIODS)[0][-1]
 fy_run_end = linear_forecast(df["runway"],  FORECAST_PERIODS)[0][-1]
@@ -600,11 +698,8 @@ lines = []
 lines.append(f"# VC Financial Results")
 lines.append(f"\n> Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
 lines.append(f"> Company: **{COMPANY_NAME}**  ")
-lines.append(f"> Data range: {df['date'].iloc[0].strftime('%Y-Q%q')} → "
-             f"{df['date'].iloc[-1].strftime('%Y-Q%q')}  "
-             .replace('%q', str((df['date'].iloc[0].month-1)//3+1))
-             .replace('%q', str((df['date'].iloc[-1].month-1)//3+1)))
-lines.append(f"> Forecast window: {FORECAST_PERIODS} quarters forward\n")
+lines.append(f"> Data range: {period_label(df['date'].iloc[0])} → {period_label(df['date'].iloc[-1])}  ")
+lines.append(f"> Forecast window: {FORECAST_PERIODS} {PERIOD}s forward\n")
 
 # ── SECTION 1: SIGNAL SUMMARY ─────────────────────────────────────────────────
 lines.append("## 1. VC Signal Summary\n")
@@ -612,32 +707,32 @@ lines.append("| Metric | Latest Value | Trend Slope | Direction | Signal |")
 lines.append("|--------|-------------|-------------|-----------|--------|")
 
 signal_table = [
-    ("Revenue (Latest Qtr)",  f"${df['revenue'].iloc[-1]/1e6:.2f}M",   slope_rev,  "up"),
-    ("QoQ Growth Rate",       f"{df['growth_rate'].iloc[-1]:.1f}%",    slope_gr,   "up"),
-    ("Burn Rate",             f"${df['burn'].iloc[-1]/1e3:.0f}K/qtr",  slope_burn, "down"),
-    ("Runway",                f"{df['runway'].iloc[-1]:.1f} months",   slope_run,  "up"),
-    ("Burn Multiple",         f"{bm_all.iloc[-1]:.2f}×",               slope_bm,   "down"),
-    ("Gross Margin",          f"{df['gross_margin'].iloc[-1]*100:.0f}%", slope_gm, "up"),
+    ("Revenue (Latest Period)", f"${df['revenue'].iloc[-1]/1e6:.2f}M",    slope_rev,  "up",   0.02),
+    ("Period Growth Rate",      f"{df['growth_rate'].dropna().iloc[-1]:.1f}%", slope_gr, "up", 2.0),
+    ("Burn Rate",               f"${df['burn'].iloc[-1]/1e3:.0f}K/{PERIOD_LABEL}", slope_burn, "down", 0.02),
+    ("Runway",                  f"{df['runway'].iloc[-1]:.1f} months",    slope_run,  "up",   1.0),
+    ("Burn Multiple",           latest_bm_label,                          slope_bm,   "down", 0.10),
+    ("Gross Margin",            f"{df['gross_margin'].iloc[-1]*100:.0f}%", slope_gm, "up",   1.0),
 ]
 
-for name, val, slope, gdir in signal_table:
-    lines.append(f"| {name} | {val} | {slope:+.3f} | {slope_label(slope, gdir)} | {signal_emoji(slope, gdir)} |")
+for name, val, slope, gdir, stable_band in signal_table:
+    lines.append(f"| {name} | {val} | {slope:+.3f} | {slope_label(slope, gdir, stable_band)} | {signal_emoji(slope, gdir, stable_band)} |")
 
 # ── SECTION 2: TIME-SERIES DATA ───────────────────────────────────────────────
-lines.append("\n## 2. Historical Data (all quarters)\n")
-lines.append("| Quarter | Revenue ($K) | Burn ($K) | Cash ($K) | Runway (mo) | Burn Mult | Gross Margin % |")
+lines.append(f"\n## 2. Historical Data (all {PERIOD}s)\n")
+lines.append(f"| Period | Revenue ($K) | Burn ($K/{PERIOD_LABEL}) | Cash ($K) | Runway (mo) | Burn Mult | Gross Margin % |")
 lines.append("|---------|-------------|----------|----------|-------------|-----------|----------------|")
 for _, row in df.iterrows():
-    qtr = row["date"].strftime("%Y-Q") + str((row["date"].month-1)//3+1)
+    qtr = period_label(row["date"])
     bm  = f"{row['burn_multiple']:.2f}" if not pd.isna(row["burn_multiple"]) else "—"
     lines.append(f"| {qtr} | {row['revenue']/1e3:.0f} | {row['burn']/1e3:.0f} | "
                  f"{row['cash']/1e3:.0f} | {row['runway']:.1f} | {bm} | {row['gross_margin']*100:.1f}% |")
 
 # ── SECTION 3: FORECASTS ──────────────────────────────────────────────────────
-lines.append("\n## 3. Linear Forecast (next quarter projections)\n")
+lines.append(f"\n## 3. Linear Forecast (next {PERIOD} projections)\n")
 lines.append("| Metric | Forecast End-Value | Method |")
 lines.append("|--------|--------------------|--------|")
-lines.append(f"| Revenue | ${fy_rev_end/1e6:.2f}M / qtr | Linear regression |")
+lines.append(f"| Revenue | ${fy_rev_end/1e6:.2f}M / {PERIOD_LABEL} | Linear regression |")
 lines.append(f"| Runway | {fy_run_end:.1f} months | Linear regression |")
 lines.append(f"| Gross Margin | {fy_gm_end:.1f}% | Linear regression |")
 lines.append(f"| Burn Multiple | {fy_bm_end:.2f}× | Linear regression |")
@@ -676,22 +771,23 @@ flags = []
 if df["runway"].iloc[-1] < 12:
     flags.append("🔴 **RUNWAY CRITICAL** — less than 12 months; fundraising urgency high.")
 elif df["runway"].iloc[-1] < 18:
-    flags.append("🟡 **RUNWAY WATCH** — 12–18 months; plan next round within 2 quarters.")
+    flags.append(f"🟡 **RUNWAY WATCH** — 12–18 months; plan next round within 2 {PERIOD}s.")
 
-if bm_all.iloc[-1] > 2.0:
-    flags.append(f"🔴 **HIGH BURN MULTIPLE** — {bm_all.iloc[-1]:.2f}× (target <1.5×); capital efficiency needs attention.")
-elif bm_all.iloc[-1] > 1.5:
-    flags.append(f"🟡 **BURN MULTIPLE ELEVATED** — {bm_all.iloc[-1]:.2f}× (target <1.5×).")
+if not pd.isna(latest_bm):
+    if latest_bm > 2.0:
+        flags.append(f"🔴 **HIGH BURN MULTIPLE** — {latest_bm:.2f}× (target <1.5×); capital efficiency needs attention.")
+    elif latest_bm > 1.5:
+        flags.append(f"🟡 **BURN MULTIPLE ELEVATED** — {latest_bm:.2f}× (target <1.5×).")
 
 if df["gross_margin"].iloc[-1] < 0.50:
     flags.append(f"🔴 **LOW GROSS MARGIN** — {df['gross_margin'].iloc[-1]*100:.0f}% (SaaS floor 70%).")
 elif df["gross_margin"].iloc[-1] < 0.70:
     flags.append(f"🟡 **GROSS MARGIN BELOW BENCHMARK** — {df['gross_margin'].iloc[-1]*100:.0f}% (target 70–80%).")
 
-if slope_gr > 0.05:
-    flags.append("🟢 **GROWTH ACCELERATING** — QoQ growth rate trend is positive.")
-elif slope_gr < -0.05:
-    flags.append("🔴 **GROWTH DECELERATING** — QoQ growth rate is declining.")
+if slope_gr > 2.0:
+    flags.append("🟢 **GROWTH ACCELERATING** — period growth rate trend is positive.")
+elif slope_gr < -2.0:
+    flags.append("🔴 **GROWTH DECELERATING** — period growth rate is declining.")
 
 if not flags:
     flags.append("🟢 All monitored metrics within acceptable ranges.")
@@ -831,9 +927,25 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import matplotlib.font_manager as fm
 from matplotlib.patches import Patch
 import warnings
 warnings.filterwarnings("ignore")
+
+def choose_font_family():
+    candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                fm.fontManager.addfont(path)
+            except Exception:
+                pass
+    return ["PingFang TC", "STHeiti", "Hiragino Sans GB", "Arial Unicode MS", "DejaVu Sans"]
 
 # ── PATHS & CONFIG ────────────────────────────────────────────────────────────
 COMPANY_NAME = "NovaSaaS Inc."           # ← change per analysis
@@ -841,6 +953,29 @@ OUT_DIR      = "./vc_analysis"
 ZIP_PATH     = "./vc_analysis_charts.zip"
 MD_PATH      = "./vc_financial_results.md"
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# ── TIME BASIS (must match source data) ───────────────────────────────────────
+PERIOD = "quarter"  # one of: "month", "quarter", "year"
+DATE_FREQ_BY_PERIOD = {"month": "MS", "quarter": "QS", "year": "YS"}
+PERIODS_PER_YEAR_BY_PERIOD = {"month": 12, "quarter": 4, "year": 1}
+PERIOD_LABEL_BY_PERIOD = {"month": "month", "quarter": "qtr", "year": "yr"}
+if PERIOD not in PERIODS_PER_YEAR_BY_PERIOD:
+    raise ValueError("PERIOD must be one of: month, quarter, year")
+DATE_FREQ = DATE_FREQ_BY_PERIOD[PERIOD]
+PERIODS_PER_YEAR = PERIODS_PER_YEAR_BY_PERIOD[PERIOD]
+MONTHS_PER_PERIOD = 12 / PERIODS_PER_YEAR
+PERIOD_LABEL = PERIOD_LABEL_BY_PERIOD[PERIOD]
+
+def annualize(values):
+    return values * PERIODS_PER_YEAR
+
+def period_label(ts):
+    ts = pd.Timestamp(ts)
+    if PERIOD == "year":
+        return f"{ts.year}"
+    if PERIOD == "quarter":
+        return f"{ts.year}-Q{(ts.month - 1)//3 + 1}"
+    return ts.strftime("%Y-%m")
 
 # ── CANVAS CONFIG ─────────────────────────────────────────────────────────────
 plt.rcParams.update({
@@ -855,7 +990,8 @@ plt.rcParams.update({
     "grid.linestyle":    "--",
     "grid.alpha":        0.5,
     "lines.linewidth":   2.2,
-    "font.family":       "DejaVu Sans",
+    "font.family":       choose_font_family(),
+    "axes.unicode_minus": False,
     "font.size":         10,
     "axes.titlesize":    13,
     "axes.titleweight":  "bold",
@@ -882,13 +1018,51 @@ def save_fig(fig, filename):
     print(f"  ✓  {filename}")
     return path
 
+def add_derived_metrics(df):
+    required = {"date", "revenue", "burn", "cash", "gross_margin"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["monthly_burn"] = df["burn"] / MONTHS_PER_PERIOD
+    df["runway"] = np.where(df["monthly_burn"] > 0, df["cash"] / df["monthly_burn"], np.nan)
+    df["annualized_revenue"] = annualize(df["revenue"])
+    df["net_new_arr"] = df["annualized_revenue"].diff()
+    df["burn_multiple"] = np.where(df["net_new_arr"] > 0, df["burn"] / df["net_new_arr"], np.nan)
+    df["revenue_ma"] = df["revenue"].rolling(3, min_periods=1).mean()
+    df["growth_rate"] = df["revenue"].pct_change() * 100
+    df["growth_ma"] = df["growth_rate"].rolling(3, min_periods=1).mean()
+    return df
+
+def linear_forecast(values, n_periods):
+    values = pd.Series(values).dropna().astype(float).to_numpy()
+    if len(values) == 0:
+        return np.full(n_periods, np.nan), 0.0
+    if len(values) == 1:
+        return np.repeat(values[-1], n_periods), 0.0
+    x = np.arange(len(values))
+    z = np.polyfit(x, values, 1)
+    p = np.poly1d(z)
+    return p(np.arange(len(values), len(values) + n_periods)), z[0]
+
+def safe_slope(values, normalize_by=None):
+    values = pd.Series(values).dropna().astype(float).to_numpy()
+    if len(values) < 2:
+        return 0.0
+    slope = np.polyfit(np.arange(len(values)), values, 1)[0]
+    if normalize_by is not None and normalize_by != 0:
+        slope = slope / normalize_by
+    return slope
+
 # ── SYNTHETIC DATA (replace with real df for actual company) ──────────────────
 np.random.seed(42)
 n        = 12
-quarters = pd.date_range(start="2022-01-01", periods=n, freq="QS")
+quarters = pd.date_range(start="2022-01-01", periods=n, freq=DATE_FREQ)
 rev_base     = [200_000 * (1.18 ** i) for i in range(n)]
 revenue      = np.array([r * np.random.uniform(0.92, 1.08) for r in rev_base])
-new_arr      = revenue * np.random.uniform(0.25, 0.45, n)
 burn_base    = [320_000 - (i * 8_000) for i in range(n)]
 burn         = np.clip([b * np.random.uniform(0.95, 1.05) for b in burn_base], 80_000, 400_000)
 gross_margin = np.linspace(0.52, 0.74, n) + np.random.uniform(-0.02, 0.02, n)
@@ -904,23 +1078,12 @@ df = pd.DataFrame({
     "revenue":       revenue,
     "burn":          burn,
     "cash":          cash,
-    "new_arr":       new_arr,
-    "runway":        cash / burn,
-    "burn_multiple": burn / np.where(new_arr > 0, new_arr, np.nan),
     "gross_margin":  gross_margin,
 })
-df["revenue_ma"]  = df["revenue"].rolling(3, min_periods=1).mean()
-df["growth_rate"] = df["revenue"].pct_change() * 100
-df["growth_ma"]   = df["growth_rate"].rolling(3, min_periods=1).mean()
+df = add_derived_metrics(df)
 
 FORECAST_PERIODS = 4
-f_dates = pd.date_range(df["date"].iloc[-1], periods=FORECAST_PERIODS + 1, freq="QS")[1:]
-
-def linear_forecast(values, n_periods):
-    x = np.arange(len(values))
-    z = np.polyfit(x, values, 1)
-    p = np.poly1d(z)
-    return p(np.arange(len(values), len(values) + n_periods)), z[0]
+f_dates = pd.date_range(df["date"].iloc[-1], periods=FORECAST_PERIODS + 1, freq=DATE_FREQ)[1:]
 
 saved_files = []
 print("\n📊  Generating charts...\n")
@@ -932,14 +1095,14 @@ fig.patch.set_facecolor("#0f0f14")
 fig.suptitle("NovaSaaS Inc.  ·  Revenue Trend + Forecast", fontsize=14,
              fontweight="bold", color="#e0e0f0")
 ax.plot(df["date"], df["revenue"]/1e6,    color=COLORS["neutral"], alpha=0.45, linewidth=1.5, label="Actual Revenue")
-ax.plot(df["date"], df["revenue_ma"]/1e6, color=COLORS["primary"], linewidth=2.8, label="3-Qtr Rolling Avg")
+ax.plot(df["date"], df["revenue_ma"]/1e6, color=COLORS["primary"], linewidth=2.8, label="3-period rolling avg")
 ax.plot(f_dates, fy_rev/1e6, color=COLORS["forecast"], linewidth=2.2, linestyle="--", label="Linear Forecast")
 ax.fill_between(f_dates, fy_rev/1e6*0.82, fy_rev/1e6*1.18, color=COLORS["forecast"], alpha=0.12, label="±18% Band")
 ax.axvline(df["date"].iloc[5], color=COLORS["accent"], linewidth=1.4, linestyle=":", alpha=0.8)
 ax.text(df["date"].iloc[5], df["revenue"].max()/1e6*0.42, "  Series A\n  $6M raised",
         color=COLORS["accent"], fontsize=9)
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.1fM"))
-ax.set_ylabel("Revenue ($M)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Revenue ($M)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="upper left"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "01_revenue_trend.png"))
@@ -947,19 +1110,19 @@ saved_files.append(save_fig(fig, "01_revenue_trend.png"))
 # ── CHART 2: Growth Rate ──────────────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(12, 6))
 fig.patch.set_facecolor("#0f0f14")
-fig.suptitle("NovaSaaS Inc.  ·  QoQ Revenue Growth Rate (%)", fontsize=14,
+fig.suptitle("NovaSaaS Inc.  ·  Period Revenue Growth Rate (%)", fontsize=14,
              fontweight="bold", color="#e0e0f0")
 valid = df["growth_rate"].notna()
 ax.fill_between(df["date"][valid], 0, df["growth_rate"][valid],
                 where=(df["growth_rate"][valid] > 0), color=COLORS["positive"], alpha=0.2, label="Positive Zone")
 ax.fill_between(df["date"][valid], 0, df["growth_rate"][valid],
                 where=(df["growth_rate"][valid] < 0), color=COLORS["danger"], alpha=0.2, label="Negative Zone")
-ax.plot(df["date"][valid], df["growth_rate"][valid], color=COLORS["neutral"], alpha=0.5, linewidth=1.5, label="Raw QoQ")
-ax.plot(df["date"][valid], df["growth_ma"][valid],   color=COLORS["primary"], linewidth=2.8, label="3-Qtr Avg")
+ax.plot(df["date"][valid], df["growth_rate"][valid], color=COLORS["neutral"], alpha=0.5, linewidth=1.5, label="Raw period growth")
+ax.plot(df["date"][valid], df["growth_ma"][valid],   color=COLORS["primary"], linewidth=2.8, label="3-Period Avg")
 ax.axhline(0,  color="#444455", linewidth=1.0)
 ax.axhline(15, color=COLORS["positive"], linewidth=1.2, linestyle=":", alpha=0.7, label="15% VC Benchmark")
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
-ax.set_ylabel("Growth Rate (%)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Growth Rate (%)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="upper right"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "02_growth_rate.png"))
@@ -967,7 +1130,7 @@ saved_files.append(save_fig(fig, "02_growth_rate.png"))
 # ── CHART 3: Burn Rate ────────────────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(12, 6))
 fig.patch.set_facecolor("#0f0f14")
-fig.suptitle("NovaSaaS Inc.  ·  Burn Rate by Quarter", fontsize=14,
+fig.suptitle("NovaSaaS Inc.  ·  Burn Rate by Period", fontsize=14,
              fontweight="bold", color="#e0e0f0")
 bar_colors = [COLORS["positive"] if r > 18 else COLORS["warning"] if r > 12
               else COLORS["danger"] for r in df["runway"]]
@@ -983,7 +1146,7 @@ legend_els = [
 ]
 ax.legend(handles=legend_els, loc="upper right")
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0fK"))
-ax.set_ylabel("Burn Rate ($K/qtr)"); ax.set_xlabel("Quarter")
+ax.set_ylabel(f"Burn Rate ($K/{PERIOD_LABEL})"); ax.set_xlabel(PERIOD.title())
 ax.grid(True, axis="y"); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "03_burn_rate.png"))
@@ -1003,7 +1166,7 @@ ax.axhline(18, color=COLORS["warning"],  linewidth=1.2, linestyle=":", alpha=0.7
 ax.axhline(12, color=COLORS["danger"],   linewidth=1.2, linestyle=":", alpha=0.7, label="12 Mo — Warning")
 ax.axhspan(0,  12, color=COLORS["danger"],  alpha=0.04)
 ax.axhspan(12, 18, color=COLORS["warning"], alpha=0.04)
-ax.set_ylabel("Runway (months)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Runway (months)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="upper left"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "04_runway.png"))
@@ -1028,7 +1191,7 @@ ax.axhspan(1.0, 1.5, color=COLORS["warning"],  alpha=0.04)
 ax.axhspan(1.5, 4.0, color=COLORS["danger"],   alpha=0.04)
 ax.fill_between(bm_dates, bm_vals, 2.0, where=(bm_vals < 2.0), color=COLORS["positive"], alpha=0.08)
 ax.set_ylim(0, 4)
-ax.set_ylabel("Burn Multiple (×)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Burn Multiple (×)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="upper right"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "05_burn_multiple.png"))
@@ -1041,7 +1204,7 @@ fig.suptitle("NovaSaaS Inc.  ·  Gross Margin % Trend", fontsize=14,
 fy_gm, slope_gm = linear_forecast(df["gross_margin"]*100, FORECAST_PERIODS)
 gm_ma = (df["gross_margin"]*100).rolling(3, min_periods=1).mean()
 ax.plot(df["date"], df["gross_margin"]*100, color=COLORS["neutral"], alpha=0.5, linewidth=1.5, label="Actual")
-ax.plot(df["date"], gm_ma, color=COLORS["accent"], linewidth=2.8, label="3-Qtr Rolling Avg")
+ax.plot(df["date"], gm_ma, color=COLORS["accent"], linewidth=2.8, label="3-period rolling avg")
 ax.plot(f_dates, fy_gm, color=COLORS["forecast"], linewidth=2.2, linestyle="--", label="Forecast")
 ax.fill_between(f_dates, fy_gm-3, fy_gm+3, color=COLORS["forecast"], alpha=0.1, label="±3pp Band")
 ax.axhline(80, color=COLORS["positive"], linewidth=1.2, linestyle=":", alpha=0.7, label="80% Top SaaS")
@@ -1049,7 +1212,7 @@ ax.axhline(70, color=COLORS["warning"],  linewidth=1.2, linestyle=":", alpha=0.7
 ax.axhline(50, color=COLORS["danger"],   linewidth=1.2, linestyle=":", alpha=0.7, label="50% Below standard")
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
 ax.set_ylim(30, 100)
-ax.set_ylabel("Gross Margin (%)"); ax.set_xlabel("Quarter")
+ax.set_ylabel("Gross Margin (%)"); ax.set_xlabel(PERIOD.title())
 ax.legend(loc="lower right"); ax.grid(True); ax.tick_params(axis="x", rotation=30)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "06_gross_margin.png"))
@@ -1061,29 +1224,31 @@ ax.set_facecolor("#0f0f14"); ax.axis("off")
 fig.suptitle("NovaSaaS Inc.  ·  VC Signal Summary", fontsize=14,
              fontweight="bold", color="#e0e0f0")
 
-def signal_row(name, current, slope, good_dir="up"):
+def signal_row(name, current, slope, good_dir="up", stable_band=0.02):
     if good_dir == "up":
-        color = COLORS["positive"] if slope > 0.05 else (COLORS["warning"] if slope > -0.02 else COLORS["danger"])
-        emoji = "●" if slope > 0.05 else ("◑" if slope > -0.02 else "○")
+        color = COLORS["positive"] if slope > stable_band else (COLORS["warning"] if slope >= -stable_band else COLORS["danger"])
+        emoji = "●" if slope > stable_band else ("◑" if slope >= -stable_band else "○")
     else:
-        color = COLORS["positive"] if slope < -0.02 else (COLORS["warning"] if slope < 0.05 else COLORS["danger"])
-        emoji = "●" if slope < -0.02 else ("◑" if slope < 0.05 else "○")
+        color = COLORS["positive"] if slope < -stable_band else (COLORS["warning"] if slope <= stable_band else COLORS["danger"])
+        emoji = "●" if slope < -stable_band else ("◑" if slope <= stable_band else "○")
     return name, current, f"{slope:+.2f}", color, emoji
 
 bm_all = df["burn_multiple"].dropna()
+latest_bm = bm_all.iloc[-1] if not bm_all.empty else np.nan
+latest_bm_label = f"{latest_bm:.2f}×" if not pd.isna(latest_bm) else "n/a"
 rows = [
-    signal_row("Revenue Growth",  f"${df['revenue'].iloc[-1]/1e6:.2f}M / qtr",
-               np.polyfit(np.arange(n), df["revenue"], 1)[0] / df["revenue"].mean(), "up"),
-    signal_row("QoQ Growth Rate", f"{df['growth_rate'].iloc[-1]:.1f}%",
-               np.polyfit(np.arange(n-1), df["growth_rate"].dropna(), 1)[0], "up"),
-    signal_row("Burn Rate",       f"${df['burn'].iloc[-1]/1e3:.0f}K / qtr",
-               np.polyfit(np.arange(n), df["burn"], 1)[0] / df["burn"].mean(), "down"),
+    signal_row("Revenue Growth",  f"${df['revenue'].iloc[-1]/1e6:.2f}M / {PERIOD_LABEL}",
+               safe_slope(df["revenue"], df["revenue"].mean()), "up", 0.02),
+    signal_row("Period Growth Rate", f"{df['growth_rate'].dropna().iloc[-1]:.1f}%",
+               safe_slope(df["growth_rate"]), "up", 2.0),
+    signal_row("Burn Rate",       f"${df['burn'].iloc[-1]/1e3:.0f}K / {PERIOD_LABEL}",
+               safe_slope(df["burn"], df["burn"].mean()), "down", 0.02),
     signal_row("Runway",          f"{df['runway'].iloc[-1]:.1f} months",
-               np.polyfit(np.arange(n), df["runway"], 1)[0], "up"),
-    signal_row("Burn Multiple",   f"{bm_all.iloc[-1]:.2f}×",
-               np.polyfit(np.arange(len(bm_all)), bm_all, 1)[0], "down"),
+               safe_slope(df["runway"]), "up", 1.0),
+    signal_row("Burn Multiple",   latest_bm_label,
+               safe_slope(bm_all), "down", 0.10),
     signal_row("Gross Margin",    f"{df['gross_margin'].iloc[-1]*100:.0f}%",
-               np.polyfit(np.arange(n), df["gross_margin"], 1)[0], "up"),
+               safe_slope(df["gross_margin"] * 100), "up", 1.0),
 ]
 
 header_y = 0.88
@@ -1101,7 +1266,7 @@ for i, (name, current, slope, color, emoji) in enumerate(rows):
     ax.text(0.80, y, emoji,   fontsize=18, color=color,     transform=ax.transAxes)
 
 note = (f"Forecast Rev (end): ${linear_forecast(df['revenue'],FORECAST_PERIODS)[0][-1]/1e6:.2f}M  ·  "
-        f"3-Qtr Avg Growth: {df['growth_ma'].iloc[-1]:.1f}%  ·  Latest QoQ: {df['growth_rate'].iloc[-1]:.1f}%")
+        f"3-period Avg Growth: {df['growth_ma'].iloc[-1]:.1f}%  ·  Latest period growth: {df['growth_rate'].iloc[-1]:.1f}%")
 ax.text(0.04, 0.04, note, fontsize=8.5, color="#555570", transform=ax.transAxes)
 plt.tight_layout(pad=2.5)
 saved_files.append(save_fig(fig, "00_vc_signal_summary.png"))
@@ -1115,9 +1280,10 @@ EV_ARR_MULTIPLE     = 8.0
 EV_ARR_RANGE        = (5.0, 12.0)
 FAILURE_PROBABILITY = 0.40
 
-ann_rev    = df["revenue"].iloc[-1] * 4
-rev_growth = df["growth_rate"].dropna().mean() / 100
-proj_revs  = [ann_rev * ((1 + rev_growth) ** yr) for yr in range(1, PROJECTION_YEARS + 1)]
+ann_rev    = df["annualized_revenue"].iloc[-1]
+avg_period_growth = df["growth_rate"].dropna().mean() / 100
+annual_growth = (1 + avg_period_growth) ** PERIODS_PER_YEAR - 1
+proj_revs  = [ann_rev * ((1 + annual_growth) ** yr) for yr in range(1, PROJECTION_YEARS + 1)]
 proj_fcfs  = [r * FCF_MARGIN for r in proj_revs]
 terminal_v = proj_fcfs[-1] * (1 + TERMINAL_GROWTH) / (DISCOUNT_RATE - TERMINAL_GROWTH)
 dcf_value  = sum(f / (1+DISCOUNT_RATE)**t for t,f in enumerate(proj_fcfs,1))
@@ -1203,23 +1369,25 @@ with zipfile.ZipFile(ZIP_PATH, "r") as zf:
 # ── WRITE vc_financial_results.md ─────────────────────────────────────────────
 import datetime
 
-def _slope_label(slope, good_dir="up"):
+def _slope_label(slope, good_dir="up", stable_band=0.02):
     if good_dir == "up":
-        return "↑ Positive" if slope > 0.05 else ("→ Stable" if slope > -0.02 else "↓ Declining")
-    return "↓ Improving" if slope < -0.02 else ("→ Stable" if slope < 0.05 else "↑ Worsening")
+        return "↑ Positive" if slope > stable_band else ("→ Stable" if slope >= -stable_band else "↓ Declining")
+    return "↓ Improving" if slope < -stable_band else ("→ Stable" if slope <= stable_band else "↑ Worsening")
 
-def _sig_emoji(slope, good_dir="up"):
+def _sig_emoji(slope, good_dir="up", stable_band=0.02):
     if good_dir == "up":
-        return "🟢" if slope > 0.05 else ("🟡" if slope > -0.02 else "🔴")
-    return "🟢" if slope < -0.02 else ("🟡" if slope < 0.05 else "🔴")
+        return "🟢" if slope > stable_band else ("🟡" if slope >= -stable_band else "🔴")
+    return "🟢" if slope < -stable_band else ("🟡" if slope <= stable_band else "🔴")
 
 bm_all   = df["burn_multiple"].dropna()
-s_rev    = np.polyfit(np.arange(n), df["revenue"], 1)[0] / df["revenue"].mean()
-s_gr     = np.polyfit(np.arange(n-1), df["growth_rate"].dropna(), 1)[0]
-s_burn   = np.polyfit(np.arange(n), df["burn"], 1)[0] / df["burn"].mean()
-s_run    = np.polyfit(np.arange(n), df["runway"], 1)[0]
-s_bm     = np.polyfit(np.arange(len(bm_all)), bm_all, 1)[0]
-s_gm     = np.polyfit(np.arange(n), df["gross_margin"]*100, 1)[0]
+latest_bm = bm_all.iloc[-1] if not bm_all.empty else np.nan
+latest_bm_label = f"{latest_bm:.2f}×" if not pd.isna(latest_bm) else "n/a"
+s_rev    = safe_slope(df["revenue"], df["revenue"].mean())
+s_gr     = safe_slope(df["growth_rate"])
+s_burn   = safe_slope(df["burn"], df["burn"].mean())
+s_run    = safe_slope(df["runway"])
+s_bm     = safe_slope(bm_all)
+s_gm     = safe_slope(df["gross_margin"]*100)
 
 fy_rev_e = linear_forecast(df["revenue"], FORECAST_PERIODS)[0][-1]
 fy_run_e = linear_forecast(df["runway"],  FORECAST_PERIODS)[0][-1]
@@ -1231,28 +1399,27 @@ lines.append("# VC Financial Results")
 lines.append(f"\n> Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
 lines.append(f"> Company: **{COMPANY_NAME}**  ")
 start_q = df['date'].iloc[0];  end_q = df['date'].iloc[-1]
-lines.append(f"> Data range: {start_q.strftime('%Y')}-Q{(start_q.month-1)//3+1} → "
-             f"{end_q.strftime('%Y')}-Q{(end_q.month-1)//3+1}  ")
-lines.append(f"> Forecast window: {FORECAST_PERIODS} quarters forward\n")
+lines.append(f"> Data range: {period_label(start_q)} → {period_label(end_q)}  ")
+lines.append(f"> Forecast window: {FORECAST_PERIODS} {PERIOD}s forward\n")
 
 lines.append("## 1. VC Signal Summary\n")
 lines.append("| Metric | Latest Value | Trend Slope | Direction | Signal |")
 lines.append("|--------|-------------|-------------|-----------|--------|")
-for name, val, slope, gdir in [
-    ("Revenue (Latest Qtr)",  f"${df['revenue'].iloc[-1]/1e6:.2f}M",    s_rev,  "up"),
-    ("QoQ Growth Rate",       f"{df['growth_rate'].iloc[-1]:.1f}%",     s_gr,   "up"),
-    ("Burn Rate",             f"${df['burn'].iloc[-1]/1e3:.0f}K/qtr",   s_burn, "down"),
-    ("Runway",                f"{df['runway'].iloc[-1]:.1f} months",    s_run,  "up"),
-    ("Burn Multiple",         f"{bm_all.iloc[-1]:.2f}×",                s_bm,   "down"),
-    ("Gross Margin",          f"{df['gross_margin'].iloc[-1]*100:.0f}%", s_gm,  "up"),
+for name, val, slope, gdir, stable_band in [
+    ("Revenue (Latest Period)", f"${df['revenue'].iloc[-1]/1e6:.2f}M",    s_rev,  "up",   0.02),
+    ("Period Growth Rate",      f"{df['growth_rate'].dropna().iloc[-1]:.1f}%", s_gr, "up", 2.0),
+    ("Burn Rate",               f"${df['burn'].iloc[-1]/1e3:.0f}K/{PERIOD_LABEL}", s_burn, "down", 0.02),
+    ("Runway",                  f"{df['runway'].iloc[-1]:.1f} months",    s_run,  "up",   1.0),
+    ("Burn Multiple",           latest_bm_label,                          s_bm,   "down", 0.10),
+    ("Gross Margin",            f"{df['gross_margin'].iloc[-1]*100:.0f}%", s_gm,  "up",   1.0),
 ]:
-    lines.append(f"| {name} | {val} | {slope:+.3f} | {_slope_label(slope,gdir)} | {_sig_emoji(slope,gdir)} |")
+    lines.append(f"| {name} | {val} | {slope:+.3f} | {_slope_label(slope,gdir,stable_band)} | {_sig_emoji(slope,gdir,stable_band)} |")
 
-lines.append("\n## 2. Historical Data (all quarters)\n")
-lines.append("| Quarter | Revenue ($K) | Burn ($K) | Cash ($K) | Runway (mo) | Burn Mult | Gross Margin % |")
+lines.append(f"\n## 2. Historical Data (all {PERIOD}s)\n")
+lines.append(f"| Period | Revenue ($K) | Burn ($K/{PERIOD_LABEL}) | Cash ($K) | Runway (mo) | Burn Mult | Gross Margin % |")
 lines.append("|---------|-------------|----------|----------|-------------|-----------|----------------|")
 for _, row in df.iterrows():
-    qtr = f"{row['date'].strftime('%Y')}-Q{(row['date'].month-1)//3+1}"
+    qtr = period_label(row["date"])
     bm  = f"{row['burn_multiple']:.2f}" if not pd.isna(row["burn_multiple"]) else "—"
     lines.append(f"| {qtr} | {row['revenue']/1e3:.0f} | {row['burn']/1e3:.0f} | "
                  f"{row['cash']/1e3:.0f} | {row['runway']:.1f} | {bm} | {row['gross_margin']*100:.1f}% |")
@@ -1260,7 +1427,7 @@ for _, row in df.iterrows():
 lines.append("\n## 3. Linear Forecast (end of projection window)\n")
 lines.append("| Metric | Forecast End-Value | Method |")
 lines.append("|--------|--------------------|--------|")
-lines.append(f"| Revenue | ${fy_rev_e/1e6:.2f}M / qtr | Linear regression |")
+lines.append(f"| Revenue | ${fy_rev_e/1e6:.2f}M / {PERIOD_LABEL} | Linear regression |")
 lines.append(f"| Runway | {fy_run_e:.1f} months | Linear regression |")
 lines.append(f"| Gross Margin | {fy_gm_e:.1f}% | Linear regression |")
 lines.append(f"| Burn Multiple | {fy_bm_e:.2f}× | Linear regression |")
@@ -1287,19 +1454,20 @@ flags = []
 if df["runway"].iloc[-1] < 12:
     flags.append("🔴 **RUNWAY CRITICAL** — less than 12 months; fundraising urgency high.")
 elif df["runway"].iloc[-1] < 18:
-    flags.append("🟡 **RUNWAY WATCH** — 12–18 months; plan next round within 2 quarters.")
-if bm_all.iloc[-1] > 2.0:
-    flags.append(f"🔴 **HIGH BURN MULTIPLE** — {bm_all.iloc[-1]:.2f}× (target <1.5×).")
-elif bm_all.iloc[-1] > 1.5:
-    flags.append(f"🟡 **BURN MULTIPLE ELEVATED** — {bm_all.iloc[-1]:.2f}× (target <1.5×).")
+    flags.append(f"🟡 **RUNWAY WATCH** — 12–18 months; plan next round within 2 {PERIOD}s.")
+if not pd.isna(latest_bm):
+    if latest_bm > 2.0:
+        flags.append(f"🔴 **HIGH BURN MULTIPLE** — {latest_bm:.2f}× (target <1.5×).")
+    elif latest_bm > 1.5:
+        flags.append(f"🟡 **BURN MULTIPLE ELEVATED** — {latest_bm:.2f}× (target <1.5×).")
 if df["gross_margin"].iloc[-1] < 0.50:
     flags.append(f"🔴 **LOW GROSS MARGIN** — {df['gross_margin'].iloc[-1]*100:.0f}% (SaaS floor 70%).")
 elif df["gross_margin"].iloc[-1] < 0.70:
     flags.append(f"🟡 **GROSS MARGIN BELOW BENCHMARK** — {df['gross_margin'].iloc[-1]*100:.0f}%.")
-if s_gr > 0.05:
-    flags.append("🟢 **GROWTH ACCELERATING** — QoQ growth rate trend is positive.")
-elif s_gr < -0.05:
-    flags.append("🔴 **GROWTH DECELERATING** — QoQ growth rate is declining.")
+if s_gr > 2.0:
+    flags.append("🟢 **GROWTH ACCELERATING** — period growth rate trend is positive.")
+elif s_gr < -2.0:
+    flags.append("🔴 **GROWTH DECELERATING** — period growth rate is declining.")
 if not flags:
     flags.append("🟢 All monitored metrics within acceptable ranges.")
 for f in flags:
