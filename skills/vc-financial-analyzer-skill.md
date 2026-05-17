@@ -1,3 +1,8 @@
+---
+name: vc-financial-analyzer
+description: Analyze startups and companies for venture capital evaluation using time-series financial metrics, forecasts, burn/runway, growth, efficiency, return signals, and Python chart exports. Use when asked to analyze company financials, show trends over time, predict revenue/burn/growth, build a VC dashboard, or create dynamic VC evaluation charts.
+---
+
 # VC Financial Analyzer Skill
 
 > **Purpose:** Evaluate companies dynamically — not as a static snapshot, but as a moving story
